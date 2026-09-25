@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+"""Verify that every sector of an optical disc (CD, audio CD, DVD, Blu-ray)
+can be read.
+
+Reads the whole disc from the raw device, retries sectors that fail, and
+reports any that stay unreadable. On audio CDs it also asks the drive for C2
+error flags (when supported), because drives quietly conceal damaged audio
+instead of returning read errors.
+
+Usage:
+    sudo disc-verify                # verify the disc in the drive
+    sudo disc-verify --eject        # eject when done (handy for a box set)
+    disc-verify --device disc.iso   # verify an image file instead
+
+DVD-Video discs are usually CSS-encrypted and many drives refuse to read the
+encrypted sectors until the host authenticates; libdvdcss is used for that
+when installed. 4K UHD and some other Blu-rays use AACS bus encryption, which
+this tool can't unlock, so such discs can show large runs of false errors.
+"""
+
+import argparse
+import bisect
+import ctypes
+import ctypes.util
+import fcntl
+import os
+import re
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+__version__ = "1.0.0"
+
+LIBDVDCSS_PATH = None  # set by the Homebrew formula
+
+DATA_SECTOR = 2048            # DVD/BD/CD-ROM (mode 1) logical sector size
+CDDA_SECTOR = 2352            # audio CD sector size
+C2_SIZE = 294                 # C2 error flags per CD sector (1 bit per byte)
+CD_FPS = 75                   # CD sectors per second of audio
+BD50_SECTORS = 24_438_784     # capacity of a dual-layer (50 GB) Blu-ray
+
+# macOS <sys/disk.h> ioctls
+DKIOCGETBLOCKSIZE = 0x40046418
+DKIOCGETBLOCKCOUNT = 0x40086419
+
+
+def _IOWR(group, num, size):
+    return 0xC0000000 | ((size & 0x1FFF) << 16) | (ord(group) << 8) | num
+
+
+# <IOKit/storage/IOCDMediaBSDClient.h>, 64-bit layouts
+class dk_cd_read_t(ctypes.Structure):
+    _fields_ = [("offset", ctypes.c_uint64),
+                ("sectorArea", ctypes.c_uint8),
+                ("sectorType", ctypes.c_uint8),
+                ("reserved0080", ctypes.c_uint8 * 10),
+                ("bufferLength", ctypes.c_uint32),
+                ("buffer", ctypes.c_void_p)]
+
+
+class dk_cd_read_toc_t(ctypes.Structure):
+    _fields_ = [("format", ctypes.c_uint8),
+                ("formatAsTime", ctypes.c_uint8),
+                ("reserved0016", ctypes.c_uint8 * 5),
+                ("address", ctypes.c_uint8),
+                ("reserved0064", ctypes.c_uint8 * 6),
+                ("bufferLength", ctypes.c_uint16),
+                ("buffer", ctypes.c_void_p)]
+
+
+DKIOCCDREAD = _IOWR("d", 96, ctypes.sizeof(dk_cd_read_t))
+DKIOCCDREADTOC = _IOWR("d", 100, ctypes.sizeof(dk_cd_read_toc_t))
+
+# <IOKit/storage/IOCDTypes.h>
+CD_AREA_USER = 0x10
+CD_AREA_ERROR_FLAGS = 0x02
+CD_TYPE_CDDA = 1
+CD_TYPE_MODE1 = 2
+CD_TYPE_MODE2 = 3
+CD_TYPE_MODE2_FORM1 = 4
+CD_TYPE_MODE2_FORM2 = 5
+CD_USER_SIZE = {CD_TYPE_CDDA: 2352, CD_TYPE_MODE1: 2048, CD_TYPE_MODE2: 2336,
+                CD_TYPE_MODE2_FORM1: 2048, CD_TYPE_MODE2_FORM2: 2324}
+CD_DATA_TYPES = [CD_TYPE_MODE1, CD_TYPE_MODE2_FORM1, CD_TYPE_MODE2_FORM2,
+                 CD_TYPE_MODE2]
+CD_TOC_FORMAT_FULL = 0x02
+
+
+class Stop(Exception):
+    pass
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
+
+
+# --------------------------------------------------------------------------
+# Finding the disc
+# --------------------------------------------------------------------------
+
+def drutil_status():
+    try:
+        return subprocess.run(["drutil", "status"], capture_output=True,
+                              text=True, timeout=30).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def parse_drutil(out):
+    """Return (device, media type string) from `drutil status` output."""
+    dev = re.search(r"Name:\s*(/dev/disk\d+)", out)
+    kind = re.search(r"Type:\s*(\S+)", out)
+    return (dev.group(1) if dev else None, kind.group(1) if kind else None)
+
+
+def classify(media_type):
+    """Map drutil's media type (CD-ROM, DVD+R, BD-RE, ...) to cd/dvd/bd."""
+    t = (media_type or "").upper()
+    for prefix, kind in (("CD", "cd"), ("DVD", "dvd"), ("BD", "bd")):
+        if t.startswith(prefix):
+            return kind
+    return None
+
+
+def raw_path(dev):
+    """Prefer the raw (unbuffered) device node: /dev/diskN -> /dev/rdiskN."""
+    m = re.fullmatch(r"/dev/disk(\d+)", dev)
+    return f"/dev/rdisk{m.group(1)}" if m else dev
+
+
+def device_size(path):
+    """Return (block_count, block_size) for a device or image file."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode):
+            return st.st_size // DATA_SECTOR, DATA_SECTOR
+        buf = fcntl.ioctl(fd, DKIOCGETBLOCKSIZE, b"\0" * 4)
+        bsize = struct.unpack("I", buf)[0]
+        buf = fcntl.ioctl(fd, DKIOCGETBLOCKCOUNT, b"\0" * 8)
+        return struct.unpack("Q", buf)[0], bsize
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
+# Readers
+#
+# read(lba, count) reads sectors [lba, lba+count). It raises OSError if the
+# drive can't deliver them, and otherwise returns the LBAs the drive flagged
+# as damaged-but-concealed (C2 errors), if it can tell.
+# --------------------------------------------------------------------------
+
+class Reader:
+    name = ""
+    sector_size = DATA_SECTOR
+    chunk = 64                # sectors per bulk read
+
+    def extents(self):
+        """Inclusive (first, last) LBA ranges to verify."""
+        return [(0, self.count - 1)]
+
+    def locate(self, lba):
+        return f"{100.0 * lba / max(self.count, 1):.1f}% into the disc"
+
+    def close(self):
+        pass
+
+
+class RawReader(Reader):
+    """Plain reads from the device node or image file."""
+    name = "raw device"
+
+    def __init__(self, path, count, sector_size=DATA_SECTOR):
+        self.fd = os.open(path, os.O_RDONLY)
+        self.count = count
+        self.sector_size = sector_size
+        self.chunk = max(1, 128 * 1024 // sector_size)
+
+    def read(self, lba, count):
+        n = count * self.sector_size
+        data = os.pread(self.fd, n, lba * self.sector_size)
+        if len(data) != n:
+            raise OSError(f"short read ({len(data)} of {n} bytes)")
+        return ()
+
+    def close(self):
+        os.close(self.fd)
+
+
+def load_libdvdcss():
+    candidates = [
+        LIBDVDCSS_PATH,
+        "/opt/homebrew/lib/libdvdcss.2.dylib",
+        "/usr/local/lib/libdvdcss.2.dylib",
+        ctypes.util.find_library("dvdcss"),
+    ]
+    for c in candidates:
+        if c and (os.path.exists(c) or not c.startswith("/")):
+            try:
+                lib = ctypes.CDLL(c)
+            except OSError:
+                continue
+            lib.dvdcss_open.restype = ctypes.c_void_p
+            lib.dvdcss_open.argtypes = [ctypes.c_char_p]
+            lib.dvdcss_close.argtypes = [ctypes.c_void_p]
+            lib.dvdcss_seek.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            lib.dvdcss_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                        ctypes.c_int, ctypes.c_int]
+            lib.dvdcss_error.restype = ctypes.c_char_p
+            lib.dvdcss_error.argtypes = [ctypes.c_void_p]
+            return lib
+    return None
+
+
+class DvdcssReader(Reader):
+    """Reads through libdvdcss, which authenticates with the drive so that
+    CSS-encrypted sectors can be read. Data is read raw (not decrypted);
+    we only care whether the drive can deliver it."""
+    name = "libdvdcss"
+
+    def __init__(self, lib, path, count):
+        self.lib = lib
+        self.count = count
+        os.environ.setdefault("DVDCSS_CACHE", "off")
+        self.h = lib.dvdcss_open(path.encode())
+        if not self.h:
+            raise OSError("libdvdcss could not open the disc")
+        self.buf = ctypes.create_string_buffer(self.chunk * DATA_SECTOR)
+
+    def _err(self):
+        msg = self.lib.dvdcss_error(self.h)
+        return msg.decode(errors="replace") if msg else "read error"
+
+    def read(self, lba, count):
+        if self.lib.dvdcss_seek(self.h, lba, 0) != lba:
+            raise OSError(f"seek failed: {self._err()}")
+        if self.lib.dvdcss_read(self.h, self.buf, count, 0) != count:
+            raise OSError(self._err())
+        return ()
+
+    def close(self):
+        self.lib.dvdcss_close(self.h)
+
+
+class Track:
+    def __init__(self, number, first, last, audio):
+        self.number, self.first, self.last, self.audio = number, first, last, audio
+        self.stype = CD_TYPE_CDDA if audio else CD_TYPE_MODE1
+
+    def __repr__(self):
+        kind = "audio" if self.audio else "data"
+        return f"Track({self.number}, {self.first}-{self.last}, {kind})"
+
+
+def parse_full_toc(data):
+    """Parse a full TOC (READ TOC format 2) into a list of Tracks.
+
+    Layout: 2-byte big-endian length, first/last session, then 11-byte
+    descriptors: session, ADR<<4|control, TNO, point, min, sec, frame,
+    zero, pmin, psec, pframe. Point 1-99 is a track start, 0xA2 the
+    session's lead-out. Control bit 0x04 marks a data track.
+    """
+    end = min(len(data), 2 + int.from_bytes(data[0:2], "big"))
+    starts, leadouts = {}, {}
+    for off in range(4, end - 10, 11):
+        session, adr_ctl, _, point = data[off:off + 4]
+        pmin, psec, pfr = data[off + 8:off + 11]
+        if adr_ctl >> 4 != 1:
+            continue
+        lba = (pmin * 60 + psec) * CD_FPS + pfr - 150
+        if 1 <= point <= 99:
+            starts[point] = (session, lba, not adr_ctl & 0x04)
+        elif point == 0xA2:
+            leadouts[session] = lba
+    tracks = []
+    numbers = sorted(starts)
+    for i, n in enumerate(numbers):
+        session, first, audio = starts[n]
+        nxt = starts.get(numbers[i + 1]) if i + 1 < len(numbers) else None
+        if nxt and nxt[0] == session:
+            last = nxt[1] - 1
+        elif session in leadouts:
+            last = leadouts[session] - 1
+        else:
+            continue
+        if last >= first:
+            tracks.append(Track(n, first, last, audio))
+    return tracks
+
+
+def c2_flagged(buf, count):
+    """Indexes of sectors whose C2 error-flag block is non-zero, for a buffer
+    of `count` sectors each laid out as 2352 bytes audio + 294 bytes flags."""
+    size = CDDA_SECTOR + C2_SIZE
+    return [i for i in range(count)
+            if any(buf[i * size + CDDA_SECTOR:(i + 1) * size])]
+
+
+class CDReader(Reader):
+    """Reads CDs track by track with the CD-specific read ioctl, so audio
+    tracks are read as 2352-byte CD-DA sectors and, when the drive
+    supports it, with C2 error flags."""
+    name = "CD reader"
+    sector_size = CDDA_SECTOR
+    chunk = 24
+
+    def __init__(self, path):
+        self.fd = os.open(path, os.O_RDONLY)
+        try:
+            self.tracks = parse_full_toc(self._read_toc())
+            if not self.tracks:
+                raise OSError("no tracks found in the table of contents")
+            self.starts = [t.first for t in self.tracks]
+            self.count = self.tracks[-1].last + 1
+            self.buf = ctypes.create_string_buffer(
+                self.chunk * (CDDA_SECTOR + C2_SIZE))
+            self.c2 = False
+            self.c2_offset_size = CDDA_SECTOR + C2_SIZE
+            if not any(t.audio for t in self.tracks):
+                self.sector_size = DATA_SECTOR
+            for t in self.tracks:
+                if not t.audio:
+                    self._probe_data_type(t)
+            self._probe_c2()
+        except BaseException:
+            os.close(self.fd)
+            raise
+
+    def _read_toc(self):
+        buf = ctypes.create_string_buffer(4096)
+        req = dk_cd_read_toc_t(format=CD_TOC_FORMAT_FULL, formatAsTime=1,
+                               bufferLength=len(buf),
+                               buffer=ctypes.addressof(buf))
+        fcntl.ioctl(self.fd, DKIOCCDREADTOC, req)
+        return buf.raw[:req.bufferLength]
+
+    def _ioctl(self, lba, count, area, stype, size, offset_size=None):
+        n = count * size
+        req = dk_cd_read_t(offset=lba * (offset_size or size),
+                           sectorArea=area, sectorType=stype,
+                           bufferLength=n, buffer=ctypes.addressof(self.buf))
+        fcntl.ioctl(self.fd, DKIOCCDREAD, req)
+        if req.bufferLength != n:
+            raise OSError(f"short read ({req.bufferLength} of {n} bytes)")
+        return self.buf.raw[:n]
+
+    def _probe_data_type(self, track):
+        """Data tracks can be mode 1 or mode 2 (CD-ROM XA, Video CD);
+        use whichever type the drive accepts for the track's first sectors."""
+        for stype in CD_DATA_TYPES:
+            for lba in range(track.first, min(track.first + 16, track.last + 1)):
+                try:
+                    self._ioctl(lba, 1, CD_AREA_USER, stype, CD_USER_SIZE[stype])
+                    track.stype = stype
+                    return
+                except OSError:
+                    continue
+
+    def _probe_c2(self):
+        """Turn on C2 checking if the drive returns error flags for audio.
+        Also confirm that the combined read addresses the same sector as a
+        plain read (compare the audio), trying both offset conventions."""
+        audio = [t for t in self.tracks if t.audio]
+        if not audio:
+            return
+        t = max(audio, key=lambda t: t.last - t.first)
+        mid = (t.first + t.last) // 2
+        for lba in range(mid, min(mid + 20, t.last + 1)):
+            try:
+                plain = self._ioctl(lba, 1, CD_AREA_USER, CD_TYPE_CDDA,
+                                    CDDA_SECTOR)
+            except OSError:
+                continue
+            if not any(plain):
+                continue      # silence would match any sector
+            for offset_size in (CDDA_SECTOR + C2_SIZE, CDDA_SECTOR):
+                try:
+                    both = self._ioctl(lba, 1, CD_AREA_USER | CD_AREA_ERROR_FLAGS,
+                                       CD_TYPE_CDDA, CDDA_SECTOR + C2_SIZE,
+                                       offset_size)
+                except OSError:
+                    return
+                if both[:CDDA_SECTOR] == plain:
+                    self.c2 = True
+                    self.c2_offset_size = offset_size
+                    return
+            return
+
+    def track_at(self, lba):
+        i = bisect.bisect_right(self.starts, lba) - 1
+        t = self.tracks[max(i, 0)]
+        return t if t.first <= lba <= t.last else None
+
+    def extents(self):
+        return [(t.first, t.last) for t in self.tracks]
+
+    def locate(self, lba):
+        t = self.track_at(lba)
+        if not t:
+            return f"sector {lba}"
+        secs = (lba - t.first) // CD_FPS
+        return f"track {t.number} at {secs // 60:02d}:{secs % 60:02d}"
+
+    def read(self, lba, count):
+        t = self.track_at(lba)
+        if t.audio and self.c2:
+            size = CDDA_SECTOR + C2_SIZE
+            try:
+                buf = self._ioctl(lba, count, CD_AREA_USER | CD_AREA_ERROR_FLAGS,
+                                  CD_TYPE_CDDA, size, self.c2_offset_size)
+                return [lba + i for i in c2_flagged(buf, count)]
+            except OSError:
+                pass          # fall through to a plain read
+        try:
+            self._ioctl(lba, count, CD_AREA_USER, t.stype, CD_USER_SIZE[t.stype])
+            return ()
+        except OSError:
+            if count > 1:
+                raise
+        # A single sector the track's type can't read may still be readable
+        # as another type (e.g. the gap between a data and an audio track).
+        for stype in [CD_TYPE_CDDA] + CD_DATA_TYPES:
+            if stype != t.stype:
+                try:
+                    self._ioctl(lba, 1, CD_AREA_USER, stype, CD_USER_SIZE[stype])
+                    return ()
+                except OSError:
+                    pass
+        raise OSError(f"unreadable sector {lba}")
+
+    def close(self):
+        os.close(self.fd)
+
+
+# --------------------------------------------------------------------------
+# Verification
+# --------------------------------------------------------------------------
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1000
+
+
+def fmt_time(s):
+    s = int(s)
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
+
+
+def ranges(sectors):
+    """Collapse sorted sector numbers into (first, last) runs."""
+    out = []
+    for s in sectors:
+        if out and s == out[-1][1] + 1:
+            out[-1][1] = s
+        else:
+            out.append([s, s])
+    return out
+
+
+class Progress:
+    def __init__(self, total, sector_size, quiet):
+        self.total = total
+        self.sector_size = sector_size
+        self.quiet = quiet or not sys.stderr.isatty()
+        self.start = time.monotonic()
+        self.last = 0.0
+
+    def line(self, done, bad, now):
+        elapsed = max(now - self.start, 1e-6)
+        rate = done * self.sector_size / elapsed
+        eta = (self.total - done) * self.sector_size / rate if rate > 0 else 0
+        pct = 100.0 * done / self.total if self.total else 100.0
+        return (f"\r  {pct:5.1f}%  {fmt_bytes(done * self.sector_size):>9} / "
+                f"{fmt_bytes(self.total * self.sector_size)}  "
+                f"{rate / 1e6:5.1f} MB/s  ETA {fmt_time(eta)}  "
+                f"problem sectors: {bad}   ")
+
+    def update(self, done, bad, force=False):
+        now = time.monotonic()
+        if self.quiet or (not force and now - self.last < 0.5):
+            return
+        self.last = now
+        sys.stderr.write(self.line(done, bad, now))
+        sys.stderr.flush()
+
+    def note(self, msg):
+        if not self.quiet:
+            sys.stderr.write("\r\033[K")
+        print(msg, flush=True)
+
+    def finish(self):
+        if not self.quiet:
+            sys.stderr.write("\n")
+
+
+def verify(reader, retries, quiet=False):
+    """Read every sector in reader.extents().
+
+    Returns (unreadable, c2, sectors_done, interrupted), where `c2` are
+    sectors that read but that the drive flagged as damaged."""
+    extents = reader.extents()
+    total = sum(last - first + 1 for first, last in extents)
+    bad, c2 = [], []
+    progress = Progress(total, reader.sector_size, quiet)
+    done = 0
+
+    def read_one(s):
+        """Read one sector with retries: 'ok', 'c2' or 'bad'."""
+        result = "bad"
+        for _ in range(retries + 1):
+            try:
+                if not reader.read(s, 1):
+                    return "ok"
+                result = "c2"
+            except OSError:
+                pass
+        return result
+
+    try:
+        for first, last in extents:
+            lba = first
+            while lba <= last:
+                count = min(reader.chunk, last - lba + 1)
+                try:
+                    suspects = list(reader.read(lba, count))
+                except OSError:
+                    # Fall back to sector-by-sector so we find exactly which
+                    # sectors are bad and still read the good ones around them.
+                    suspects = range(lba, lba + count)
+                for s in suspects:
+                    result = read_one(s)
+                    if result == "bad":
+                        bad.append(s)
+                        progress.note(f"  unreadable sector {s} "
+                                      f"({reader.locate(s)})")
+                    elif result == "c2":
+                        c2.append(s)
+                        progress.note(f"  damaged sector {s}, C2 errors "
+                                      f"({reader.locate(s)})")
+                    progress.update(done + s - lba + 1, len(bad) + len(c2))
+                lba += count
+                done += count
+                progress.update(done, len(bad) + len(c2))
+    except (KeyboardInterrupt, Stop):
+        progress.finish()
+        return bad, c2, done, True
+    progress.update(done, len(bad) + len(c2), force=True)
+    progress.finish()
+    return bad, c2, done, False
+
+
+def report(title, sectors, reader):
+    runs = ranges(sectors)
+    print(f"{title}: {len(sectors):,} sector(s) in {len(runs)} region(s):")
+    for a, b in runs[:50]:
+        span = f"{a}" if a == b else f"{a}-{b} ({b - a + 1} sectors)"
+        print(f"  {span:>32}  {reader.locate(a)}")
+    if len(runs) > 50:
+        print(f"  ... and {len(runs) - 50} more regions")
+    return max(b - a + 1 for a, b in runs)
+
+
+def open_reader(kind, path, count, bsize, is_image, use_css):
+    """Pick the reader for the media type; returns (reader, notes)."""
+    notes = []
+    if kind == "cd" or (kind is None and not is_image and bsize == CDDA_SECTOR):
+        try:
+            reader = CDReader(path)
+            if any(t.audio for t in reader.tracks):
+                notes.append("checking C2 error flags on audio tracks" if reader.c2
+                             else "drive doesn't report C2 errors; checking "
+                                  "read errors only")
+            return reader, notes
+        except OSError as e:
+            notes.append(f"couldn't read the CD's table of contents ({e}); "
+                         "reading the whole device instead")
+    elif kind == "dvd" and use_css and not is_image:
+        lib = load_libdvdcss()
+        if lib:
+            try:
+                return DvdcssReader(lib, path, count * bsize // DATA_SECTOR), notes
+            except OSError as e:
+                notes.append(f"{e}; falling back to plain reads")
+        else:
+            notes.append("libdvdcss not found. If this is a CSS-protected "
+                         "movie disc, the drive\n        may refuse encrypted "
+                         "sectors and they will show up as errors.\n"
+                         "        Fix: brew install libdvdcss")
+    return RawReader(path, count, bsize), notes
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Verify that every sector of a CD, DVD or Blu-ray is "
+                    "readable.")
+    ap.add_argument("--device", "-d",
+                    help="device (e.g. /dev/disk4) or image file; "
+                         "default: the disc in the optical drive")
+    ap.add_argument("--retries", "-r", type=int, default=3,
+                    help="extra attempts for each failing sector (default 3)")
+    ap.add_argument("--no-css", action="store_true",
+                    help="don't use libdvdcss for DVDs even if installed")
+    ap.add_argument("--eject", "-e", action="store_true",
+                    help="eject the disc when finished")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="no progress bar")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}")
+    args = ap.parse_args()
+
+    def on_term(*_):
+        raise Stop()
+    # Let `kill` (SIGTERM) produce a partial report just like Ctrl-C.
+    signal.signal(signal.SIGTERM, on_term)
+
+    dev, media = args.device, None
+    from_drive = dev is None
+    if from_drive:
+        dev, media = parse_drutil(drutil_status())
+        if not dev:
+            die("No disc found in the optical drive. Insert a disc, wait "
+                "for it to spin up, and try again (or pass --device).")
+    path = raw_path(dev)
+    kind = classify(media)
+
+    try:
+        count, bsize = device_size(path)
+        is_image = stat.S_ISREG(os.stat(path).st_mode)
+    except PermissionError:
+        die(f"Permission denied opening {path}. Run with sudo:\n"
+            f"  sudo {' '.join(sys.argv)}")
+    except OSError as e:
+        die(f"Cannot open {path}: {e}")
+    if count == 0:
+        die(f"{path} reports a size of 0 sectors - is a disc inserted?")
+
+    try:
+        reader, notes = open_reader(kind, path, count, bsize, is_image,
+                                    not args.no_css)
+    except PermissionError:
+        die(f"Permission denied opening {path}. Run with sudo.")
+    except OSError as e:
+        die(f"Cannot open {path}: {e}")
+
+    total = sum(b - a + 1 for a, b in reader.extents())
+    print(f"Verifying {path}" + (f" ({media})" if media else ""))
+    if isinstance(reader, CDReader):
+        n_audio = sum(t.audio for t in reader.tracks)
+        parts = [f"{n} {name}" for n, name in
+                 ((n_audio, "audio"), (len(reader.tracks) - n_audio, "data"))
+                 if n]
+        print(f"  {len(reader.tracks)} track(s) ({', '.join(parts)}), "
+              f"{total:,} sectors, {fmt_time(total / CD_FPS)} long")
+    else:
+        print(f"  {total:,} sectors, {fmt_bytes(total * reader.sector_size)}, "
+              f"reading via {reader.name}")
+    if kind == "bd" and count * bsize > BD50_SECTORS * DATA_SECTOR:
+        notes.append("this disc is larger than 50 GB, so it is probably a 4K "
+                     "UHD Blu-ray.\n        UHD discs use bus encryption, and "
+                     "the drive may refuse reads\n        this tool can't "
+                     "unlock; those would show up as errors.")
+    for n in notes:
+        print(f"  note: {n}")
+
+    started = time.monotonic()
+    try:
+        bad, c2, done, interrupted = verify(reader, args.retries,
+                                            quiet=args.quiet)
+    finally:
+        reader.close()
+    elapsed = time.monotonic() - started
+
+    print()
+    if interrupted:
+        print(f"INTERRUPTED after {done:,} of {total:,} sectors "
+              f"({100.0 * done / total:.1f}%) in {fmt_time(elapsed)}.")
+    if bad:
+        longest = report("FAILED: unreadable", bad, reader)
+        if longest >= 1000 or len(bad) > total // 100:
+            print()
+            print("  hint: large unbroken runs of bad sectors usually mean the "
+                  "drive refused\n        to read protected content, not "
+                  "that the disc is damaged.")
+            if kind == "bd":
+                print("        This Blu-ray may use AACS bus encryption "
+                      "(common on 4K UHD\n        discs), which this tool "
+                      "can't unlock. Try the disc in a player.")
+            elif kind == "dvd":
+                print("        Check that libdvdcss is installed and that the "
+                      "drive's region\n        matches the disc's.")
+            elif kind == "cd":
+                print("        Some copy-protected audio CDs contain "
+                      "deliberately broken\n        sectors. Try the disc in "
+                      "a CD player.")
+    if c2:
+        if bad:
+            print()
+        report("DAMAGED: read with C2 errors (audio was patched over, "
+               "may be audible)", c2, reader)
+    if not bad and not c2 and not interrupted:
+        print(f"OK: all {total:,} sectors read successfully "
+              f"in {fmt_time(elapsed)}.")
+
+    if args.eject and from_drive and not interrupted:
+        subprocess.run(["drutil", "eject"], capture_output=True)
+
+    sys.exit(130 if interrupted else (1 if bad or c2 else 0))
+
+
+if __name__ == "__main__":
+    main()
