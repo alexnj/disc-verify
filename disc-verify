@@ -3,7 +3,7 @@
 can be read.
 
 Reads the whole disc from the raw device, retries sectors that fail, and
-reports any that stay unreadable. On audio CDs it also asks the drive for C2
+reports any that stay unreadable. Runs on macOS and Linux. On audio CDs it also asks the drive for C2
 error flags (when supported), because drives quietly conceal damaged audio
 instead of returning read errors.
 
@@ -22,7 +22,11 @@ import argparse
 import bisect
 import ctypes
 import ctypes.util
+import errno
 import fcntl
+import glob
+import grp
+import mmap
 import os
 import re
 import signal
@@ -41,6 +45,8 @@ CDDA_SECTOR = 2352            # audio CD sector size
 C2_SIZE = 294                 # C2 error flags per CD sector (1 bit per byte)
 CD_FPS = 75                   # CD sectors per second of audio
 BD50_SECTORS = 24_438_784     # capacity of a dual-layer (50 GB) Blu-ray
+
+LINUX = sys.platform.startswith("linux")
 
 # macOS <sys/disk.h> ioctls
 DKIOCGETBLOCKSIZE = 0x40046418
@@ -88,6 +94,94 @@ CD_DATA_TYPES = [CD_TYPE_MODE1, CD_TYPE_MODE2_FORM1, CD_TYPE_MODE2_FORM2,
                  CD_TYPE_MODE2]
 CD_TOC_FORMAT_FULL = 0x02
 
+# Linux <linux/fs.h> and <linux/cdrom.h>
+BLKSSZGET = 0x1268
+BLKGETSIZE64 = 0x80081272
+CDROM_DRIVE_STATUS = 0x5326
+CDSL_CURRENT = 0x7FFFFFFF
+CDS_DISC_OK = 4
+
+# Linux <scsi/sg.h>. On Linux the CD reads are sent to the drive as MMC
+# commands. The macOS CD_AREA_* and CD_TYPE_* values above are the same bits
+# the MMC READ CD command uses, so both platforms share them.
+SG_IO = 0x2285
+SG_DXFER_FROM_DEV = -3
+SCSI_TIMEOUT_MS = 60_000
+MMC_READ_TOC = 0x43
+MMC_GET_CONFIGURATION = 0x46
+MMC_READ_CD = 0xBE
+
+# MMC current profile -> media type, named like drutil's Type: field
+MMC_PROFILES = {
+    0x08: "CD-ROM", 0x09: "CD-R", 0x0A: "CD-RW",
+    0x10: "DVD-ROM", 0x11: "DVD-R", 0x12: "DVD-RAM", 0x13: "DVD-RW",
+    0x14: "DVD-RW", 0x15: "DVD-R-DL", 0x16: "DVD-R-DL", 0x1A: "DVD+RW",
+    0x1B: "DVD+R", 0x2A: "DVD+RW-DL", 0x2B: "DVD+R-DL",
+    0x40: "BD-ROM", 0x41: "BD-R", 0x42: "BD-R", 0x43: "BD-RE",
+}
+
+
+class sg_io_hdr(ctypes.Structure):
+    _fields_ = [("interface_id", ctypes.c_int),
+                ("dxfer_direction", ctypes.c_int),
+                ("cmd_len", ctypes.c_ubyte),
+                ("mx_sb_len", ctypes.c_ubyte),
+                ("iovec_count", ctypes.c_ushort),
+                ("dxfer_len", ctypes.c_uint),
+                ("dxferp", ctypes.c_void_p),
+                ("cmdp", ctypes.c_void_p),
+                ("sbp", ctypes.c_void_p),
+                ("timeout", ctypes.c_uint),
+                ("flags", ctypes.c_uint),
+                ("pack_id", ctypes.c_int),
+                ("usr_ptr", ctypes.c_void_p),
+                ("status", ctypes.c_ubyte),
+                ("masked_status", ctypes.c_ubyte),
+                ("msg_status", ctypes.c_ubyte),
+                ("sb_len_wr", ctypes.c_ubyte),
+                ("host_status", ctypes.c_ushort),
+                ("driver_status", ctypes.c_ushort),
+                ("resid", ctypes.c_int),
+                ("duration", ctypes.c_uint),
+                ("info", ctypes.c_uint)]
+
+
+def sense_message(sense):
+    """Describe SCSI sense data (fixed or descriptor format)."""
+    if len(sense) >= 14 and sense[0] & 0x7F in (0x70, 0x71):
+        key, asc, ascq = sense[2] & 0x0F, sense[12], sense[13]
+    elif len(sense) >= 4 and sense[0] & 0x7F in (0x72, 0x73):
+        key, asc, ascq = sense[1] & 0x0F, sense[2], sense[3]
+    else:
+        return "drive reported an error"
+    return f"drive reported an error (sense {key:X}/{asc:02X}/{ascq:02X})"
+
+
+def scsi_read(fd, cdb, buf, n):
+    """Send an MMC command that reads up to n bytes into buf (a ctypes
+    buffer); return the number of bytes the drive transferred."""
+    cmd = ctypes.create_string_buffer(bytes(cdb), len(cdb))
+    sense = ctypes.create_string_buffer(64)
+    h = sg_io_hdr(interface_id=ord("S"), dxfer_direction=SG_DXFER_FROM_DEV,
+                  cmd_len=len(cdb), mx_sb_len=len(sense), dxfer_len=n,
+                  dxferp=ctypes.addressof(buf), cmdp=ctypes.addressof(cmd),
+                  sbp=ctypes.addressof(sense), timeout=SCSI_TIMEOUT_MS)
+    fcntl.ioctl(fd, SG_IO, h)
+    if h.status or h.host_status or h.driver_status or h.info & 1:
+        raise OSError(errno.EIO, sense_message(sense.raw[:h.sb_len_wr]))
+    return n - h.resid
+
+
+def read_cd_cdb(lba, count, area, stype):
+    """MMC READ CD: `area` selects the fields returned per sector (0x10 user
+    data, 0x02 C2 flags) and `stype` the expected sector type."""
+    return (bytes([MMC_READ_CD, stype << 2]) + lba.to_bytes(4, "big")
+            + count.to_bytes(3, "big") + bytes([area, 0, 0]))
+
+
+LIBDVDCSS_HINT = ("install libdvdcss (e.g. apt install libdvdcss2)" if LINUX
+                  else "brew install libdvdcss")
+
 
 class Stop(Exception):
     pass
@@ -96,6 +190,28 @@ class Stop(Exception):
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(2)
+
+
+def permission_help(path):
+    """How to get read access to the device: sudo on macOS; on Linux,
+    usually membership in the group that owns the drive."""
+    cmd = f"  sudo {' '.join(sys.argv)}"
+    if not LINUX:
+        return f"Run with sudo:\n{cmd}"
+    try:
+        group = grp.getgrgid(os.stat(path).st_gid).gr_name
+    except (OSError, KeyError):
+        return f"Run with sudo:\n{cmd}"
+    return (f"Add yourself to the '{group}' group (then log in again):\n"
+            f"  sudo usermod -aG {group} $USER\nor run with sudo:\n{cmd}")
+
+
+def eject(dev):
+    cmd = ["eject", dev] if LINUX else ["drutil", "eject"]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +231,48 @@ def parse_drutil(out):
     dev = re.search(r"Name:\s*(/dev/disk\d+)", out)
     kind = re.search(r"Type:\s*(\S+)", out)
     return (dev.group(1) if dev else None, kind.group(1) if kind else None)
+
+
+def linux_media(fd):
+    """Media type of the disc in the drive, from its MMC current profile."""
+    buf = ctypes.create_string_buffer(8)
+    try:
+        scsi_read(fd, [MMC_GET_CONFIGURATION, 0x02, 0, 0, 0, 0, 0, 0, 8, 0],
+                  buf, 8)
+    except OSError:
+        return None
+    return MMC_PROFILES.get(int.from_bytes(buf.raw[6:8], "big"))
+
+
+def linux_find_disc():
+    """Return (device, media type) for the first drive with a disc in it."""
+    denied = None
+    drives = sorted(glob.glob("/dev/sr[0-9]*"),
+                    key=lambda d: int(re.sub(r"\D", "", d)))
+    for dev in drives:
+        try:
+            fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+        except PermissionError:
+            denied = denied or dev
+            continue
+        except OSError:
+            continue
+        try:
+            if fcntl.ioctl(fd, CDROM_DRIVE_STATUS, CDSL_CURRENT) == CDS_DISC_OK:
+                return dev, linux_media(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    # A drive we can't open may hold the disc; let the caller report that.
+    return denied, None
+
+
+def find_disc():
+    """Return (device, media type string) for the disc in the drive."""
+    if LINUX:
+        return linux_find_disc()
+    return parse_drutil(drutil_status())
 
 
 def classify(media_type):
@@ -139,6 +297,10 @@ def device_size(path):
         st = os.fstat(fd)
         if stat.S_ISREG(st.st_mode):
             return st.st_size // DATA_SECTOR, DATA_SECTOR
+        if LINUX:
+            bsize = struct.unpack("i", fcntl.ioctl(fd, BLKSSZGET, b"\0" * 4))[0]
+            buf = fcntl.ioctl(fd, BLKGETSIZE64, b"\0" * 8)
+            return struct.unpack("Q", buf)[0] // bsize, bsize
         buf = fcntl.ioctl(fd, DKIOCGETBLOCKSIZE, b"\0" * 4)
         bsize = struct.unpack("I", buf)[0]
         buf = fcntl.ioctl(fd, DKIOCGETBLOCKCOUNT, b"\0" * 8)
@@ -176,20 +338,34 @@ class RawReader(Reader):
     name = "raw device"
 
     def __init__(self, path, count, sector_size=DATA_SECTOR):
-        self.fd = os.open(path, os.O_RDONLY)
         self.count = count
         self.sector_size = sector_size
         self.chunk = max(1, 128 * 1024 // sector_size)
+        self.buf = None
+        if LINUX and stat.S_ISBLK(os.stat(path).st_mode):
+            # Bypass the page cache (the Linux counterpart of /dev/rdiskN),
+            # so every read, and every retry, really goes to the disc.
+            # O_DIRECT needs an aligned buffer; mmap memory is page-aligned.
+            self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            self.buf = mmap.mmap(-1, self.chunk * sector_size)
+        else:
+            self.fd = os.open(path, os.O_RDONLY)
 
     def read(self, lba, count):
         n = count * self.sector_size
-        data = os.pread(self.fd, n, lba * self.sector_size)
-        if len(data) != n:
-            raise OSError(f"short read ({len(data)} of {n} bytes)")
+        offset = lba * self.sector_size
+        if self.buf is not None:
+            got = os.preadv(self.fd, [memoryview(self.buf)[:n]], offset)
+        else:
+            got = len(os.pread(self.fd, n, offset))
+        if got != n:
+            raise OSError(f"short read ({got} of {n} bytes)")
         return ()
 
     def close(self):
         os.close(self.fd)
+        if self.buf is not None:
+            self.buf.close()
 
 
 def load_libdvdcss():
@@ -197,6 +373,7 @@ def load_libdvdcss():
         LIBDVDCSS_PATH,
         "/opt/homebrew/lib/libdvdcss.2.dylib",
         "/usr/local/lib/libdvdcss.2.dylib",
+        "libdvdcss.so.2",
         ctypes.util.find_library("dvdcss"),
     ]
     for c in candidates:
@@ -310,7 +487,7 @@ class CDReader(Reader):
     chunk = 24
 
     def __init__(self, path):
-        self.fd = os.open(path, os.O_RDONLY)
+        self.fd = os.open(path, os.O_RDONLY | (os.O_NONBLOCK if LINUX else 0))
         try:
             self.tracks = parse_full_toc(self._read_toc())
             if not self.tracks:
@@ -333,6 +510,10 @@ class CDReader(Reader):
 
     def _read_toc(self):
         buf = ctypes.create_string_buffer(4096)
+        if LINUX:
+            cdb = [MMC_READ_TOC, 0x02, CD_TOC_FORMAT_FULL, 0, 0, 0, 1,
+                   len(buf) >> 8, len(buf) & 0xFF, 0]
+            return buf.raw[:scsi_read(self.fd, cdb, buf, len(buf))]
         req = dk_cd_read_toc_t(format=CD_TOC_FORMAT_FULL, formatAsTime=1,
                                bufferLength=len(buf),
                                buffer=ctypes.addressof(buf))
@@ -341,6 +522,14 @@ class CDReader(Reader):
 
     def _ioctl(self, lba, count, area, stype, size, offset_size=None):
         n = count * size
+        if LINUX:
+            # READ CD addresses sectors directly, so offset_size (a quirk of
+            # the macOS ioctl) doesn't apply.
+            got = scsi_read(self.fd, read_cd_cdb(lba, count, area, stype),
+                            self.buf, n)
+            if got != n:
+                raise OSError(f"short read ({got} of {n} bytes)")
+            return self.buf.raw[:n]
         req = dk_cd_read_t(offset=lba * (offset_size or size),
                            sectorArea=area, sectorType=stype,
                            bufferLength=n, buffer=ctypes.addressof(self.buf))
@@ -592,7 +781,7 @@ def open_reader(kind, path, count, bsize, is_image, use_css):
             notes.append("libdvdcss not found. If this is a CSS-protected "
                          "movie disc, the drive\n        may refuse encrypted "
                          "sectors and they will show up as errors.\n"
-                         "        Fix: brew install libdvdcss")
+                         f"        Fix: {LIBDVDCSS_HINT}")
     return RawReader(path, count, bsize), notes
 
 
@@ -601,7 +790,7 @@ def main():
         description="Verify that every sector of a CD, DVD or Blu-ray is "
                     "readable.")
     ap.add_argument("--device", "-d",
-                    help="device (e.g. /dev/disk4) or image file; "
+                    help="device (e.g. /dev/disk4 or /dev/sr0) or image file; "
                          "default: the disc in the optical drive")
     ap.add_argument("--retries", "-r", type=int, default=3,
                     help="extra attempts for each failing sector (default 3)")
@@ -623,7 +812,7 @@ def main():
     dev, media = args.device, None
     from_drive = dev is None
     if from_drive:
-        dev, media = parse_drutil(drutil_status())
+        dev, media = find_disc()
         if not dev:
             die("No disc found in the optical drive. Insert a disc, wait "
                 "for it to spin up, and try again (or pass --device).")
@@ -633,23 +822,30 @@ def main():
     try:
         count, bsize = device_size(path)
         is_image = stat.S_ISREG(os.stat(path).st_mode)
+        if LINUX and not media and stat.S_ISBLK(os.stat(path).st_mode):
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                media = linux_media(fd)
+            finally:
+                os.close(fd)
+            kind = classify(media)
     except PermissionError:
-        die(f"Permission denied opening {path}. Run with sudo:\n"
-            f"  sudo {' '.join(sys.argv)}")
+        die(f"Permission denied opening {path}. {permission_help(path)}")
     except OSError as e:
         die(f"Cannot open {path}: {e}")
-    if count == 0:
-        die(f"{path} reports a size of 0 sectors - is a disc inserted?")
 
     try:
         reader, notes = open_reader(kind, path, count, bsize, is_image,
                                     not args.no_css)
     except PermissionError:
-        die(f"Permission denied opening {path}. Run with sudo.")
+        die(f"Permission denied opening {path}. {permission_help(path)}")
     except OSError as e:
         die(f"Cannot open {path}: {e}")
 
     total = sum(b - a + 1 for a, b in reader.extents())
+    if total == 0:
+        reader.close()
+        die(f"{path} reports a size of 0 sectors - is a disc inserted?")
     print(f"Verifying {path}" + (f" ({media})" if media else ""))
     if isinstance(reader, CDReader):
         n_audio = sum(t.audio for t in reader.tracks)
@@ -709,7 +905,7 @@ def main():
               f"in {fmt_time(elapsed)}.")
 
     if args.eject and from_drive and not interrupted:
-        subprocess.run(["drutil", "eject"], capture_output=True)
+        eject(dev)
 
     sys.exit(130 if interrupted else (1 if bad or c2 else 0))
 

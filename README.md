@@ -2,7 +2,7 @@
 
 Check that every sector of an optical disc can be read: data CDs, audio CDs,
 DVDs and Blu-rays. Useful for checking second-hand discs, old backups or a box
-set before you rely on them. macOS only.
+set before you rely on them. Runs on macOS and Linux.
 
 disc-verify reads the whole disc, start to finish, straight from the drive,
 including menus, extras and unused space. It retries any sector that fails and
@@ -19,12 +19,18 @@ OK: all 3,791,488 sectors read successfully in 0:11:52.
 
 ## Install
 
+On macOS:
+
 ```sh
 brew install alexnj/tap/disc-verify
 ```
 
 This also installs [libdvdcss](https://www.videolan.org/developers/libdvdcss.html),
 which is needed to read most movie DVDs (see [DVDs](#dvds)).
+
+On Linux, copy the `disc-verify` script somewhere on your `PATH` (it needs
+only Python 3). For movie DVDs, also install your distribution's libdvdcss
+package (`libdvdcss2` on Debian/Ubuntu, `libdvdcss` on Arch and Fedora).
 
 You need an optical drive that can read the disc: a DVD drive for
 CDs and DVDs, a Blu-ray drive for Blu-rays.
@@ -34,6 +40,7 @@ CDs and DVDs, a Blu-ray drive for Blu-rays.
 ```sh
 sudo disc-verify              # verify the disc in the drive
 sudo disc-verify --eject      # ...and eject it when done
+disc-verify --device /dev/sr1 # Linux: pick a drive (default: first with a disc)
 disc-verify --device disc.iso # verify an image file
 ```
 
@@ -41,12 +48,14 @@ disc-verify --device disc.iso # verify an image file
 |---|---|
 | `-e`, `--eject` | Eject the disc when finished (handy when checking a stack of discs) |
 | `-r N`, `--retries N` | Extra attempts for each failing sector (default 3) |
-| `-d PATH`, `--device PATH` | Device such as `/dev/disk4`, or an image file. Default: the disc in the optical drive |
+| `-d PATH`, `--device PATH` | Device such as `/dev/disk4` (macOS) or `/dev/sr0` (Linux), or an image file. Default: the disc in the optical drive |
 | `--no-css` | Don't use libdvdcss for DVDs |
 | `-q`, `--quiet` | No progress bar |
 
-`sudo` is needed because macOS only lets root read a disc directly. Without
-it, disc-verify tells you so and exits.
+On macOS, `sudo` is needed because only root can read a disc directly. On
+Linux, members of the group that owns the drive (usually `optical` or
+`cdrom`) can run it without `sudo`. Without access, disc-verify tells you
+what to do and exits.
 
 ## Reading the results
 
@@ -95,7 +104,7 @@ errors.
 Most DVD drives also have a **region** setting. If the disc's region doesn't
 match the drive's, the drive refuses to read the encrypted parts. On macOS
 you can set the drive's region by inserting a disc and opening the DVD Player
-app. Drives only allow about five region changes, and the last one is
+app; on Linux, with the `regionset` tool. Drives only allow about five region changes, and the last one is
 permanent.
 
 ### Blu-rays
