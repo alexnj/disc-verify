@@ -169,6 +169,31 @@ class MiscTest(unittest.TestCase):
         import ctypes
         self.assertEqual(ctypes.sizeof(dv.dk_cd_read_t), 32)
         self.assertEqual(ctypes.sizeof(dv.dk_cd_read_toc_t), 24)
+        self.assertEqual(ctypes.sizeof(dv.sg_io_hdr), 88)
+
+
+class LinuxTest(unittest.TestCase):
+    def test_read_cd_cdb(self):
+        cdb = dv.read_cd_cdb(0x12345, 24,
+                             dv.CD_AREA_USER | dv.CD_AREA_ERROR_FLAGS,
+                             dv.CD_TYPE_CDDA)
+        self.assertEqual(cdb, bytes([0xBE, 0x04, 0x00, 0x01, 0x23, 0x45,
+                                     0x00, 0x00, 24, 0x12, 0, 0]))
+        cdb = dv.read_cd_cdb(0, 1, dv.CD_AREA_USER, dv.CD_TYPE_MODE2_FORM2)
+        self.assertEqual(cdb[1], 5 << 2)
+        self.assertEqual(cdb[9], 0x10)
+
+    def test_sense_message(self):
+        fixed = bytes([0x70, 0, 0x03] + [0] * 9 + [0x11, 0x05])
+        self.assertIn("3/11/05", dv.sense_message(fixed))
+        desc = bytes([0x72, 0x05, 0x6F, 0x03])
+        self.assertIn("5/6F/03", dv.sense_message(desc))
+        self.assertEqual(dv.sense_message(b""), "drive reported an error")
+
+    def test_profiles_classify(self):
+        for profile, kind in [(0x08, "cd"), (0x0A, "cd"), (0x10, "dvd"),
+                              (0x2B, "dvd"), (0x40, "bd"), (0x43, "bd")]:
+            self.assertEqual(dv.classify(dv.MMC_PROFILES[profile]), kind)
 
 
 class MainTest(unittest.TestCase):
@@ -189,7 +214,7 @@ class MainTest(unittest.TestCase):
         self.assertIn("OK: all 300 sectors", out)
 
     def test_no_disc(self):
-        with mock.patch.object(dv, "drutil_status", return_value=""):
+        with mock.patch.object(dv, "find_disc", return_value=(None, None)):
             code, _ = self.run_main()
         self.assertEqual(code, 2)
 
