@@ -6,7 +6,9 @@ set before you rely on them. Runs on macOS and Linux.
 
 disc-verify reads the whole disc, start to finish, straight from the drive,
 including menus, extras and unused space. It retries any sector that fails and
-tells you exactly which parts of the disc can't be read.
+tells you exactly which parts of the disc can't be read. Areas the drive can
+only crawl through are skipped and reported, so a copy-protected or badly
+damaged disc doesn't take all night.
 
 ```
 $ sudo disc-verify --eject
@@ -47,7 +49,10 @@ disc-verify --device disc.iso # verify an image file
 | Option | |
 |---|---|
 | `-e`, `--eject` | Eject the disc when finished (handy when checking a stack of discs) |
-| `-r N`, `--retries N` | Extra attempts for each failing sector (default 3) |
+| `-r N`, `--retries N` | Extra attempts for each failing sector (default 1) |
+| `--end N` | Stop after sector N, e.g. to re-read just one skipped area with `--thorough` |
+| `-s N`, `--start N` | Start at sector N, e.g. to continue a run that stopped. A stopped run prints the command to use |
+| `-t`, `--thorough` | Don't skip areas the drive reads very slowly; read every sector however long it takes |
 | `-d PATH`, `--device PATH` | Device such as `/dev/disk4` (macOS) or `/dev/sr0` (Linux), or an image file. Default: the disc in the optical drive |
 | `--no-css` | Don't use libdvdcss for DVDs |
 | `-q`, `--quiet` | No progress bar |
@@ -66,12 +71,19 @@ what to do and exits.
 - **DAMAGED: read with C2 errors** (audio CDs only): the drive read these
   sectors but reported that it had to patch over damaged audio. This can be
   heard as clicks or dropouts.
+- **SKIPPED**: the drive read these areas so slowly (seconds per read instead
+  of a fraction of a second) that disc-verify skipped ahead to where reading
+  was quick again. See [Slow areas](#slow-areas).
+- **STOPPED: the drive stopped responding**: sectors that read fine earlier in
+  the run started failing too, so the drive, not the disc, has stopped
+  working. Unplug the drive (or power-cycle it) to reset it.
 
 Press Ctrl-C at any time to stop. You still get a report for the part that
 was read.
 
-Exit codes: `0` all OK, `1` unreadable or damaged sectors found, `2` setup
-problem (no disc, no permission), `130` interrupted.
+Exit codes: `0` all OK, `1` unreadable, damaged or skipped sectors found, `2`
+setup problem (no disc, no permission), `3` the drive stopped responding,
+`130` interrupted.
 
 **Where the damage is matters.** Discs are read from the centre outward, so
 damage late in a single-layer disc means the outer edge, where scratches and
@@ -126,6 +138,23 @@ Copy protection can look like damage:
   unreadable sectors** that players skip. If a disc has a small bad region but
   plays through fine in a player, this may be why.
 
+### Slow areas
+
+Some DVD copy protections go further: they fill whole cells of the video
+files with deliberately damaged sectors and use the menus to steer players
+around them. A drive reading through such an area slows to a crawl (a few
+KB/s), and some drives lock up after a while and fail every read, even of
+sectors they read fine a minute earlier, until they are unplugged.
+
+So when several reads in a row are very slow, disc-verify skips ahead and
+reports the skipped area. On a DVD-Video disc it skips the rest of the slow
+cell, the unit these decoys come in; elsewhere it probes further and further
+ahead until reading is quick again. Either way the drive spends as little
+time as possible in the slow area. It also notices when the drive stops
+responding, and stops rather than reporting the rest of the disc as bad. On a
+disc you burned yourself, a slow area is an early sign of damage. Use
+`--thorough` to read slow areas anyway.
+
 ## How long it takes
 
 It depends on the drive and the disc. Rough guide:
@@ -138,7 +167,8 @@ It depends on the drive and the disc. Rough guide:
 | Blu-ray 25 GB | 30–60 min |
 | Blu-ray 50 GB | 1–2 h |
 
-Damaged areas take longer because of the retries.
+Damaged areas take longer: each failed read can take several seconds while
+the drive tries to recover.
 
 ## Development
 

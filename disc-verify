@@ -96,6 +96,7 @@ CD_TOC_FORMAT_FULL = 0x02
 
 # Linux <linux/fs.h> and <linux/cdrom.h>
 BLKSSZGET = 0x1268
+BLKSECTGET = 0x1267
 BLKGETSIZE64 = 0x80081272
 CDROM_DRIVE_STATUS = 0x5326
 CDSL_CURRENT = 0x7FFFFFFF
@@ -105,11 +106,13 @@ CDS_DISC_OK = 4
 # commands. The macOS CD_AREA_* and CD_TYPE_* values above are the same bits
 # the MMC READ CD command uses, so both platforms share them.
 SG_IO = 0x2285
+SG_GET_VERSION_NUM = 0x2282
 SG_DXFER_FROM_DEV = -3
 SCSI_TIMEOUT_MS = 60_000
 MMC_READ_TOC = 0x43
 MMC_GET_CONFIGURATION = 0x46
 MMC_READ_CD = 0xBE
+MMC_READ_12 = 0xA8
 
 # MMC current profile -> media type, named like drutil's Type: field
 MMC_PROFILES = {
@@ -146,15 +149,31 @@ class sg_io_hdr(ctypes.Structure):
                 ("info", ctypes.c_uint)]
 
 
+class ScsiError(OSError):
+    def __init__(self, sense):
+        self.sense = parse_sense(sense)
+        super().__init__(errno.EIO, sense_message(sense))
+
+
+def parse_sense(sense):
+    """(key, ASC, ASCQ) from SCSI sense data, or None."""
+    if len(sense) >= 14 and sense[0] & 0x7F in (0x70, 0x71):
+        return sense[2] & 0x0F, sense[12], sense[13]
+    if len(sense) >= 4 and sense[0] & 0x7F in (0x72, 0x73):
+        return sense[1] & 0x0F, sense[2], sense[3]
+    return None
+
+
 def sense_message(sense):
     """Describe SCSI sense data (fixed or descriptor format)."""
-    if len(sense) >= 14 and sense[0] & 0x7F in (0x70, 0x71):
-        key, asc, ascq = sense[2] & 0x0F, sense[12], sense[13]
-    elif len(sense) >= 4 and sense[0] & 0x7F in (0x72, 0x73):
-        key, asc, ascq = sense[1] & 0x0F, sense[2], sense[3]
-    else:
+    s = parse_sense(sense)
+    if not s:
         return "drive reported an error"
-    return f"drive reported an error (sense {key:X}/{asc:02X}/{ascq:02X})"
+    return f"drive reported an error (sense {s[0]:X}/{s[1]:02X}/{s[2]:02X})"
+
+
+# The drive refuses a CSS-scrambled sector: it isn't (or no longer) unlocked.
+SENSE_CSS_LOCKED = (0x5, 0x6F, 0x03)
 
 
 def scsi_read(fd, cdb, buf, n):
@@ -168,7 +187,7 @@ def scsi_read(fd, cdb, buf, n):
                   sbp=ctypes.addressof(sense), timeout=SCSI_TIMEOUT_MS)
     fcntl.ioctl(fd, SG_IO, h)
     if h.status or h.host_status or h.driver_status or h.info & 1:
-        raise OSError(errno.EIO, sense_message(sense.raw[:h.sb_len_wr]))
+        raise ScsiError(sense.raw[:h.sb_len_wr])
     return n - h.resid
 
 
@@ -204,6 +223,21 @@ def permission_help(path):
         return f"Run with sudo:\n{cmd}"
     return (f"Add yourself to the '{group}' group (then log in again):\n"
             f"  sudo usermod -aG {group} $USER\nor run with sudo:\n{cmd}")
+
+
+def resume_command(sector):
+    """This run's command line, set to start at `sector`."""
+    args, skip = [], False
+    for a in sys.argv[1:]:
+        if skip:
+            skip = False
+        elif a in ("--start", "-s"):
+            skip = True
+        elif not a.startswith("--start="):
+            args.append(a)
+    prefix = "sudo " if os.geteuid() == 0 else ""
+    return " ".join([prefix + os.path.basename(sys.argv[0])] + args
+                    + ["--start", str(sector)])
 
 
 def eject(dev):
@@ -366,6 +400,72 @@ class RawReader(Reader):
         os.close(self.fd)
         if self.buf is not None:
             self.buf.close()
+
+
+def sg_capable(path):
+    """True if `path` is a Linux block device that takes SCSI commands."""
+    if not LINUX or not stat.S_ISBLK(os.stat(path).st_mode):
+        return False
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        fcntl.ioctl(fd, SG_GET_VERSION_NUM, b"\0" * 4)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+class SgReader(Reader):
+    """Linux: sends READ commands straight to the drive. Like O_DIRECT this
+    bypasses the page cache, and it also skips the kernel's own retries,
+    so a failing read costs one drive timeout instead of two."""
+    name = "direct reads"
+
+    def __init__(self, path, count, name=None, unlock=None):
+        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.count = count
+        self.name = name or self.name
+        # Called to unlock the drive again when it refuses encrypted sectors.
+        # Tried once per run of refusals, so a disc that can't be unlocked
+        # doesn't make every read pay for it.
+        self.unlock, self.may_unlock = unlock, True
+        try:
+            # The largest transfer the kernel accepts, in 512-byte units.
+            limit = struct.unpack("H", fcntl.ioctl(self.fd, BLKSECTGET,
+                                                   b"\0" * 2))[0]
+            self.chunk = max(1, min(64, limit * 512 // DATA_SECTOR))
+        except OSError:
+            self.chunk = 32
+        self.buf = ctypes.create_string_buffer(self.chunk * DATA_SECTOR)
+
+    def read(self, lba, count):
+        n = count * DATA_SECTOR
+        cdb = (bytes([MMC_READ_12, 0]) + lba.to_bytes(4, "big")
+               + count.to_bytes(4, "big") + bytes([0, 0]))
+        try:
+            got = scsi_read(self.fd, cdb, self.buf, n)
+        except ScsiError as e:
+            if e.sense != SENSE_CSS_LOCKED or not (self.unlock
+                                                   and self.may_unlock):
+                raise
+            self.may_unlock = False
+            self.unlock()
+            got = scsi_read(self.fd, cdb, self.buf, n)
+        if got != n:
+            raise OSError(f"short read ({got} of {n} bytes)")
+        self.may_unlock = True
+        return ()
+
+    def close(self):
+        os.close(self.fd)
+
+
+def direct_reader(path, count, bsize):
+    """The reader for plain sector reads of a device or image file."""
+    if bsize == DATA_SECTOR and sg_capable(path):
+        return SgReader(path, count)
+    return RawReader(path, count, bsize)
 
 
 def load_libdvdcss():
@@ -627,6 +727,120 @@ class CDReader(Reader):
 
 
 # --------------------------------------------------------------------------
+# DVD-Video cells
+#
+# Some DVD copy protections (ARccOS, RipGuard and the like) fill cells of the
+# video files with deliberately damaged sectors and use the menus to steer
+# players around them. Drives crawl through those cells, and some lock up
+# after a while. Verification skips a slow cell as a whole, so we only need
+# where the cells start and end.
+# --------------------------------------------------------------------------
+
+def merge_ranges(rs):
+    """Sort inclusive (first, last) ranges and merge touching ones."""
+    out = []
+    for a, b in sorted(rs):
+        if out and a <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], b))
+        else:
+            out.append((a, b))
+    return out
+
+
+def iso9660_dir(read, lba, size):
+    """{NAME: (lba, size)} for the entries of an ISO 9660 directory."""
+    data = read(lba, (size + DATA_SECTOR - 1) // DATA_SECTOR)
+    entries, off = {}, 0
+    while off < len(data):
+        n = data[off]
+        if n == 0:        # records don't cross sectors; skip the padding
+            off = (off // DATA_SECTOR + 1) * DATA_SECTOR
+            continue
+        rec = data[off:off + n]
+        name = rec[33:33 + rec[32]].decode("ascii", "replace").split(";")[0]
+        entries[name.upper()] = (int.from_bytes(rec[2:6], "little"),
+                                 int.from_bytes(rec[10:14], "little"))
+        off += n
+    return entries
+
+
+def ifo_cells(ifo, ifo_lba):
+    """Absolute (first, last) sectors of the cells in an IFO's cell address
+    tables: the menu cells and, for a title set, the title cells."""
+    if ifo[:12] not in (b"DVDVIDEO-VMG", b"DVDVIDEO-VTS"):
+        raise ValueError("not an IFO file")
+    be = lambda off: int.from_bytes(ifo[off:off + 4], "big")
+    tables = [(0xC0, 0xD8)]                  # menu VOBS, menu cell table
+    if ifo[:12] == b"DVDVIDEO-VTS":
+        tables.append((0xC4, 0xE0))          # title VOBS, title cell table
+    cells = []
+    for vobs_at, table_at in tables:
+        vobs, table = be(vobs_at), be(table_at) * DATA_SECTOR
+        if not vobs or not table:
+            continue
+        end = min(len(ifo), table + be(table + 4) + 1)
+        for off in range(table + 8, end - 11, 12):
+            first, last = be(off + 4), be(off + 8)
+            if first <= last:
+                cells.append((ifo_lba + vobs + first, ifo_lba + vobs + last))
+    return cells
+
+
+def dvd_cells(path):
+    """Sorted (first, last) sectors of every DVD-Video cell on the disc, or
+    [] if it isn't a DVD-Video disc with an ISO 9660 file system."""
+    try:
+        sg = sg_capable(path)
+        fd = os.open(path, os.O_RDONLY | (os.O_NONBLOCK if sg else 0))
+    except OSError:
+        return []
+    buf = ctypes.create_string_buffer(32 * DATA_SECTOR)
+
+    def read(lba, count):
+        if not sg:
+            data = os.pread(fd, count * DATA_SECTOR, lba * DATA_SECTOR)
+            if len(data) != count * DATA_SECTOR:
+                raise OSError("short read")
+            return data
+        # Read exactly these sectors: reads through the kernel come in
+        # 4 KB pages, and an IFO's last page can reach into an encrypted
+        # VOB that the drive refuses to read.
+        data = b""
+        while count:
+            n = min(count, 32)
+            cdb = (bytes([MMC_READ_12, 0]) + lba.to_bytes(4, "big")
+                   + n.to_bytes(4, "big") + bytes([0, 0]))
+            if scsi_read(fd, cdb, buf, n * DATA_SECTOR) != n * DATA_SECTOR:
+                raise OSError("short read")
+            data += buf.raw[:n * DATA_SECTOR]
+            lba, count = lba + n, count - n
+        return data
+
+    try:
+        pvd = read(16, 1)
+        if pvd[0:6] != b"\x01CD001":
+            return []
+        root = pvd[156:190]
+        top = iso9660_dir(read, int.from_bytes(root[2:6], "little"),
+                          int.from_bytes(root[10:14], "little"))
+        if "VIDEO_TS" not in top:
+            return []
+        cells = set()
+        for name, (lba, size) in iso9660_dir(read, *top["VIDEO_TS"]).items():
+            if re.fullmatch(r"VIDEO_TS\.IFO|VTS_\d\d_0\.IFO", name):
+                try:
+                    ifo = read(lba, (size + DATA_SECTOR - 1) // DATA_SECTOR)
+                    cells.update(ifo_cells(ifo, lba))
+                except (OSError, ValueError, IndexError):
+                    continue      # still use the cells of the others
+        return sorted(cells)
+    except (OSError, ValueError, IndexError):
+        return []
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
 # Verification
 # --------------------------------------------------------------------------
 
@@ -661,7 +875,7 @@ class Progress:
         self.start = time.monotonic()
         self.last = 0.0
 
-    def line(self, done, bad, now):
+    def line(self, done, bad, now, skipped=0):
         elapsed = max(now - self.start, 1e-6)
         rate = done * self.sector_size / elapsed
         eta = (self.total - done) * self.sector_size / rate if rate > 0 else 0
@@ -669,14 +883,15 @@ class Progress:
         return (f"\r  {pct:5.1f}%  {fmt_bytes(done * self.sector_size):>9} / "
                 f"{fmt_bytes(self.total * self.sector_size)}  "
                 f"{rate / 1e6:5.1f} MB/s  ETA {fmt_time(eta)}  "
-                f"problem sectors: {bad}   ")
+                f"problem sectors: {bad}"
+                + (f"  skipped: {skipped}" if skipped else "") + "   ")
 
-    def update(self, done, bad, force=False):
+    def update(self, done, bad, skipped=0, force=False):
         now = time.monotonic()
         if self.quiet or (not force and now - self.last < 0.5):
             return
         self.last = now
-        sys.stderr.write(self.line(done, bad, now))
+        sys.stderr.write(self.line(done, bad, now, skipped))
         sys.stderr.flush()
 
     def note(self, msg):
@@ -689,65 +904,273 @@ class Progress:
             sys.stderr.write("\n")
 
 
-def verify(reader, retries, quiet=False):
-    """Read every sector in reader.extents().
+SLOW_READ = 1.5           # seconds; a healthy read takes a fraction of that
+SLOW_STREAK = 3           # this many slow reads in a row mean a slow region
+FIRST_JUMP = 1024         # sectors; first step past a slow region, doubling
+MAX_JUMP = 65536          # sectors; the largest single step past a slow region
+AFTER_SKIP = 16           # chunks after a skip in which one slow read is enough
+GROUP_GAP = 4096          # sectors; skips closer than this are reported as one
 
-    Returns (unreadable, c2, sectors_done, interrupted), where `c2` are
-    sectors that read but that the drive flagged as damaged."""
+
+class DriveStuck(Exception):
+    pass
+
+
+class Result:
+    def __init__(self, bad, c2, skipped, done, stopped, resume=None):
+        self.bad = bad            # unreadable sectors
+        self.c2 = c2              # sectors read with C2 errors
+        self.skipped = skipped    # (first, last) ranges skipped as too slow
+        self.done = done          # sectors checked (or skipped)
+        self.stopped = stopped    # None, "interrupted" or "stuck"
+        self.resume = resume      # if stopped: where to continue
+
+
+def verify(reader, retries, quiet=False, thorough=False, cells=(),
+           clock=time.monotonic):
+    """Read every sector in reader.extents(), in three passes:
+
+    1. Read in chunks. Chunks that fail are set aside for pass 2. Where
+       reads become very slow, skip ahead (unless `thorough`): copy
+       protection decoys and badly damaged areas can take hours to crawl
+       through, and some drives lock up in them, so touch them as little as
+       possible. Inside a DVD-Video cell (`cells`, sorted (first, last)),
+       skip the rest of the cell; elsewhere, probe further and further
+       ahead until reads are quick again.
+    2. Read the failed chunks sector by sector to find the bad sectors.
+    3. Retry each bad sector `retries` more times.
+
+    Whenever a read fails slowly, re-read a sector that read fine earlier.
+    If that fails too, the drive has stopped responding, and everything
+    after that would be reported as bad, so stop."""
     extents = reader.extents()
     total = sum(last - first + 1 for first, last in extents)
-    bad, c2 = [], []
+    bad, c2, skipped, failed = set(), [], [], []
     progress = Progress(total, reader.sector_size, quiet)
     done = 0
+    canary = recent = None      # the first and the latest sector read fine
+    resume = None               # where pass 1 had got to
+    pending, pending_at = 0, None   # failed[pending:] not rechecked yet,
+                                    # the first of them from pending_at on
 
-    def read_one(s):
-        """Read one sector with retries: 'ok', 'c2' or 'bad'."""
+    def update(force=False):
+        progress.update(done, len(bad) + len(c2),
+                        sum(b - a + 1 for a, b in skipped), force)
+
+    def timed_read(lba, count):
+        """Return (C2 suspects, or None if the read failed; whether it was
+        slow). Checks the drive after a slow failure."""
+        start = clock()
+        try:
+            suspects = list(reader.read(lba, count))
+        except OSError:
+            suspects = None
+        slow = clock() - start > SLOW_READ
+        if suspects is None and slow and canary is not None:
+            # Try the latest good sector first: a drive in a bad state can
+            # fail on some parts of the disc (often near the start) while
+            # still reading others.
+            for s in [recent, recent, canary, canary]:
+                try:
+                    reader.read(s, 1)
+                    break
+                except OSError:
+                    pass
+            else:
+                raise DriveStuck()
+        return suspects, slow
+
+    def read_one(s, attempts):
+        """Read one sector up to `attempts` times: 'ok', 'c2' or 'bad'."""
         result = "bad"
-        for _ in range(retries + 1):
-            try:
-                if not reader.read(s, 1):
-                    return "ok"
+        for _ in range(attempts):
+            suspects, _ = timed_read(s, 1)
+            if suspects == []:
+                return "ok"
+            if suspects:
                 result = "c2"
-            except OSError:
-                pass
         return result
 
+    def check_c2(s):
+        """A sector read with C2 errors; see whether a re-read is clean."""
+        if read_one(s, retries) == "ok":
+            return
+        c2.append(s)
+        progress.note(f"  damaged sector {s}, C2 errors ({reader.locate(s)})")
+
+    stretch = None    # [first, last] of the slow stretch being skipped
+
+    def skip(first, last):
+        """Record a skipped range. Skips close together are one slow
+        stretch, reported as one when it ends (see end_stretch)."""
+        nonlocal stretch
+        skipped.append((first, last))
+        if stretch and first - stretch[1] <= GROUP_GAP:
+            stretch = [min(stretch[0], first), max(stretch[1], last)]
+        else:
+            end_stretch()
+            stretch = [first, last]
+
+    def end_stretch():
+        nonlocal stretch
+        if not stretch:
+            return
+        first, last = stretch
+        areas = merge_ranges([r for r in skipped
+                              if first <= r[0] and r[1] <= last])
+        n = sum(b - a + 1 for a, b in areas)
+        where = reader.locate(first)
+        if len(areas) == 1:
+            progress.note(f"  skipped sectors {first}-{last}, the drive "
+                          f"reads them very slowly ({where})")
+        else:
+            progress.note(f"  skipped {n:,} sectors in {len(areas)} slow "
+                          f"areas between sectors {first} and {last} "
+                          f"({where})")
+        stretch = None
+
+    def cell_end(lba):
+        """Last sector of the (smallest) DVD-Video cell holding lba."""
+        i = bisect.bisect_right(cells, (lba, float("inf")))
+        ends = [b for a, b in cells[max(0, i - 64):i] if a <= lba <= b]
+        return min(ends) if ends else None
+
+    def is_slow(lba, last):
+        return timed_read(lba, min(reader.chunk, last - lba + 1))[1]
+
+    def skip_slow_region(lba, last, jump):
+        """Skip a slow region starting at `lba`; return (where to resume,
+        the step to use if the next region is slow too)."""
+        end = cell_end(lba - 1)       # the cell of the last slow read
+        if end is not None:
+            # Cells can be huge; if the region goes on, the first slow read
+            # after this skip triggers the next one.
+            pos = min(max(end + 1, lba), lba + MAX_JUMP, last + 1)
+        else:
+            # Probe further and further ahead. Slow regions can be patchy,
+            # so resume only where two reads in a row are quick.
+            pos = lba
+            while True:
+                pos = min(pos + jump, last + 1)
+                jump = min(jump * 2, MAX_JUMP)
+                if pos > last or not is_slow(pos, last) and (
+                        pos + reader.chunk > last
+                        or not is_slow(pos + reader.chunk, last)):
+                    break
+        if pos > lba:
+            skip(lba, pos - 1)
+        return pos, jump
+
     try:
+        # Pass 1
+        jump, since_skip = FIRST_JUMP, None
         for first, last in extents:
-            lba = first
+            lba, streak = first, 0
             while lba <= last:
+                resume = lba
                 count = min(reader.chunk, last - lba + 1)
-                try:
-                    suspects = list(reader.read(lba, count))
-                except OSError:
-                    # Fall back to sector-by-sector so we find exactly which
-                    # sectors are bad and still read the good ones around them.
-                    suspects = range(lba, lba + count)
-                for s in suspects:
-                    result = read_one(s)
-                    if result == "bad":
-                        bad.append(s)
-                        progress.note(f"  unreadable sector {s} "
-                                      f"({reader.locate(s)})")
-                    elif result == "c2":
-                        c2.append(s)
-                        progress.note(f"  damaged sector {s}, C2 errors "
-                                      f"({reader.locate(s)})")
-                    progress.update(done + s - lba + 1, len(bad) + len(c2))
+                suspects, slow = timed_read(lba, count)
+                if suspects is None:
+                    failed.append((lba, count))
+                else:
+                    canary = lba if canary is None else canary
+                    recent = lba
+                    done += count
+                    for s in suspects:
+                        check_c2(s)
+                if slow and not streak:
+                    streak_start = lba
+                streak = streak + 1 if slow else 0
                 lba += count
-                done += count
-                progress.update(done, len(bad) + len(c2))
+                # Right after a skip, a single slow read means we haven't
+                # got past the slow region yet: skip again, further.
+                after_skip = since_skip is not None and since_skip < AFTER_SKIP
+                if since_skip is not None:
+                    since_skip += 1
+                if stretch and lba - stretch[1] > GROUP_GAP:
+                    end_stretch()         # reads have been quick for a while
+                if not after_skip:
+                    jump = FIRST_JUMP
+                if (not thorough and lba <= last and slow
+                        and (streak >= SLOW_STREAK or after_skip)):
+                    resume, jump = skip_slow_region(lba, last, jump)
+                    done += resume - lba
+                    # Chunks that failed in the streak that led here are part
+                    # of the slow region too; rechecking them sector by
+                    # sector would mean a long wait for each sector.
+                    for f in [f for f in failed if f[0] >= streak_start]:
+                        failed.remove(f)
+                        skip(f[0], f[0] + f[1] - 1)
+                        done += f[1]
+                    lba, streak, since_skip = resume, 0, 0
+                update()
+
+        end_stretch()
+
+        # Pass 2
+        if failed:
+            progress.note(f"  rechecking {len(failed)} failed area(s) sector "
+                          "by sector")
+        resume = None
+        for i, (lba, count) in enumerate(failed):
+            pending, streak = i, 0
+            for s in range(lba, lba + count):
+                pending_at = s
+                suspects, slow = timed_read(s, 1)
+                done += 1
+                if suspects is None:
+                    bad.add(s)
+                else:
+                    canary = s if canary is None else canary
+                    recent = s
+                    for s2 in suspects:
+                        check_c2(s2)
+                streak = streak + 1 if slow else 0
+                if streak >= SLOW_STREAK and not thorough and s < lba + count - 1:
+                    skip(s + 1, lba + count - 1)
+                    end_stretch()
+                    done += lba + count - 1 - s
+                    break
+                update()
+        pending = len(failed)
+
+        # Pass 3
+        for s in sorted(bad):
+            result = read_one(s, retries)
+            if result != "bad":
+                bad.discard(s)
+            if result == "c2":
+                c2.append(s)
+            if result != "ok":
+                what = "unreadable" if result == "bad" else "damaged"
+                progress.note(f"  {what} sector {s} ({reader.locate(s)})")
+            update()
+        stopped = None
     except (KeyboardInterrupt, Stop):
-        progress.finish()
-        return bad, c2, done, True
-    progress.update(done, len(bad) + len(c2), force=True)
+        stopped = "interrupted"
+    except DriveStuck:
+        stopped = "stuck"
+    end_stretch()
+    if stopped:
+        # Chunks that failed but weren't narrowed down to sectors yet count
+        # as unreadable. The resume point stays where pass 1 got to, so a
+        # later run doesn't go straight back into what may have hung the
+        # drive.
+        for i, (lba, count) in enumerate(failed[pending:]):
+            first = pending_at if i == 0 and pending_at is not None else lba
+            bad.update(range(first, lba + count))
+    if not stopped:
+        update(force=True)
     progress.finish()
-    return bad, c2, done, False
+    return Result(sorted(bad), sorted(c2), merge_ranges(skipped), done, stopped,
+                  resume if stopped else None)
 
 
-def report(title, sectors, reader):
-    runs = ranges(sectors)
-    print(f"{title}: {len(sectors):,} sector(s) in {len(runs)} region(s):")
+
+def report(title, runs, reader):
+    """List (first, last) sector runs; return the length of the longest."""
+    count = sum(b - a + 1 for a, b in runs)
+    print(f"{title}: {count:,} sector(s) in {len(runs)} region(s):")
     for a, b in runs[:50]:
         span = f"{a}" if a == b else f"{a}-{b} ({b - a + 1} sectors)"
         print(f"  {span:>32}  {reader.locate(a)}")
@@ -772,7 +1195,21 @@ def open_reader(kind, path, count, bsize, is_image, use_css):
                          "reading the whole device instead")
     elif kind == "dvd" and use_css and not is_image:
         lib = load_libdvdcss()
-        if lib:
+        if lib and sg_capable(path):
+            # Authenticating unlocks the drive (usually until the disc is
+            # changed), so the direct reads can then be used.
+            def unlock():
+                h = lib.dvdcss_open(path.encode())
+                if h:
+                    lib.dvdcss_close(h)
+                return bool(h)
+            if unlock():
+                return SgReader(path, count * bsize // DATA_SECTOR,
+                                "direct reads, unlocked with libdvdcss",
+                                unlock), notes
+            notes.append("libdvdcss could not open the disc; falling back to "
+                         "plain reads")
+        elif lib:
             try:
                 return DvdcssReader(lib, path, count * bsize // DATA_SECTOR), notes
             except OSError as e:
@@ -782,7 +1219,7 @@ def open_reader(kind, path, count, bsize, is_image, use_css):
                          "movie disc, the drive\n        may refuse encrypted "
                          "sectors and they will show up as errors.\n"
                          f"        Fix: {LIBDVDCSS_HINT}")
-    return RawReader(path, count, bsize), notes
+    return direct_reader(path, count, bsize), notes
 
 
 def main():
@@ -792,8 +1229,17 @@ def main():
     ap.add_argument("--device", "-d",
                     help="device (e.g. /dev/disk4 or /dev/sr0) or image file; "
                          "default: the disc in the optical drive")
-    ap.add_argument("--retries", "-r", type=int, default=3,
-                    help="extra attempts for each failing sector (default 3)")
+    ap.add_argument("--retries", "-r", type=int, default=1,
+                    help="extra attempts for each failing sector (default 1)")
+    ap.add_argument("--thorough", "-t", action="store_true",
+                    help="don't skip regions the drive reads very slowly; "
+                         "read every sector however long it takes")
+    ap.add_argument("--start", "-s", type=int, default=0, metavar="SECTOR",
+                    help="start at this sector, e.g. to continue a run that "
+                         "was stopped")
+    ap.add_argument("--end", type=int, metavar="SECTOR",
+                    help="stop after this sector, e.g. to re-read just a "
+                         "skipped area with --thorough")
     ap.add_argument("--no-css", action="store_true",
                     help="don't use libdvdcss for DVDs even if installed")
     ap.add_argument("--eject", "-e", action="store_true",
@@ -842,6 +1288,12 @@ def main():
     except OSError as e:
         die(f"Cannot open {path}: {e}")
 
+    cells = [] if isinstance(reader, CDReader) else dvd_cells(path)
+    if args.start or args.end is not None:
+        end = float("inf") if args.end is None else args.end
+        extents = [(max(a, args.start), min(b, end)) for a, b in reader.extents()
+                   if b >= args.start and a <= end]
+        reader.extents = lambda: extents
     total = sum(b - a + 1 for a, b in reader.extents())
     if total == 0:
         reader.close()
@@ -867,18 +1319,33 @@ def main():
 
     started = time.monotonic()
     try:
-        bad, c2, done, interrupted = verify(reader, args.retries,
-                                            quiet=args.quiet)
+        r = verify(reader, args.retries, quiet=args.quiet,
+                   thorough=args.thorough, cells=cells)
     finally:
         reader.close()
     elapsed = time.monotonic() - started
+    bad, c2, skipped = r.bad, r.c2, r.skipped
 
     print()
-    if interrupted:
-        print(f"INTERRUPTED after {done:,} of {total:,} sectors "
-              f"({100.0 * done / total:.1f}%) in {fmt_time(elapsed)}.")
+    if r.stopped == "interrupted":
+        print(f"INTERRUPTED after {r.done:,} of {total:,} sectors "
+              f"({100.0 * r.done / total:.1f}%) in {fmt_time(elapsed)}.")
+    elif r.stopped == "stuck":
+        print(f"STOPPED after {r.done:,} of {total:,} sectors "
+              f"({100.0 * r.done / total:.1f}%): the drive stopped "
+              "responding.\n  Sectors it read fine earlier now fail too, so "
+              "the remaining errors\n  would be the drive's, not the disc's. "
+              "Unplug the drive or power-cycle\n  it to reset it.")
+        if args.thorough:
+            print("  Without --thorough, slow regions are skipped, which "
+                  "usually avoids this.")
+    if r.resume is not None:
+        print(f"  To continue from sector {r.resume:,} later:\n"
+              f"    {resume_command(r.resume)}")
+    if r.stopped:
+        print()
     if bad:
-        longest = report("FAILED: unreadable", bad, reader)
+        longest = report("FAILED: unreadable", ranges(bad), reader)
         if longest >= 1000 or len(bad) > total // 100:
             print()
             print("  hint: large unbroken runs of bad sectors usually mean the "
@@ -899,15 +1366,31 @@ def main():
         if bad:
             print()
         report("DAMAGED: read with C2 errors (audio was patched over, "
-               "may be audible)", c2, reader)
-    if not bad and not c2 and not interrupted:
+               "may be audible)", ranges(c2), reader)
+    if skipped:
+        if bad or c2:
+            print()
+        report("SKIPPED: the drive read these very slowly, so they were not "
+               "checked", skipped, reader)
+        print()
+        print("  hint: commercial discs can contain deliberately damaged "
+              "areas (copy\n        protection) that players never read, "
+              "and drives crawl through\n        them. On other discs, slow "
+              "areas are an early sign of damage.\n        --thorough reads "
+              "them anyway, but it can take hours and some\n        drives "
+              "lock up until they are power-cycled.")
+    if not bad and not c2 and not skipped and not r.stopped:
         print(f"OK: all {total:,} sectors read successfully "
               f"in {fmt_time(elapsed)}.")
+    elif not r.stopped:
+        print(f"\nFinished in {fmt_time(elapsed)}.")
 
-    if args.eject and from_drive and not interrupted:
+    if args.eject and from_drive and not r.stopped:
         eject(dev)
 
-    sys.exit(130 if interrupted else (1 if bad or c2 else 0))
+    if r.stopped:
+        sys.exit(130 if r.stopped == "interrupted" else 3)
+    sys.exit(1 if bad or c2 or skipped else 0)
 
 
 if __name__ == "__main__":
